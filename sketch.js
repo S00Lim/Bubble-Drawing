@@ -1,3 +1,4 @@
+
 /***********************
   Bubble Type Drawing (Square Stage)
   - JS builds: layout + styles + DOM
@@ -74,6 +75,11 @@ let thumbAnimStartMsByLetter = Array(26).fill(0);
 // ===== drawing state =====
 let wasDrawing = false;
 let wasClearHandOpen = false;
+
+
+let lastTips = null; // { ix, iy, tx, ty }
+const TIP_JUMP_RESET = 180; // px (필요하면 150~220 조절)
+
 
 // ================================
 // ✅ PINCH + DRAWING TUNING (STABLE)
@@ -398,6 +404,44 @@ function scoreHandForPick(lm) {
   return anchorScore * 2.2 + dScore * 0.8;
 }
 
+function distN(a, b) {
+  return dist(a.x, a.y, b.x, b.y);
+}
+
+// ✅ "이 프레임이 진짜 thumb-index 핀치/드로잉 자세인가?" 판정
+function isValidPinchPose(lm) {
+  const thumb = lm[4];
+  const idx   = lm[8];
+  const mid   = lm[12];
+  const ring  = lm[16];
+  const pink  = lm[20];
+
+  const dIdx  = distN(thumb, idx);
+  const dMid  = distN(thumb, mid);
+  const dRing = distN(thumb, ring);
+  const dPink = distN(thumb, pink);
+
+  const minOther = Math.min(dMid, dRing, dPink);
+
+  // ✅ 핵심 1: thumb가 "index"가 가장 가까워야 함 (여유 마진 포함)
+  const MARGIN = 0.012; // 노이즈 여유(필요하면 0.015까지)
+  if (dIdx > minOther - MARGIN) return false;
+
+  // ✅ 핵심 2: 너무 벌어진 상태면(핀치/드로잉 자세 아님) 차단
+  // (이 값이 낮을수록 "다른 제스처"에서 오작동이 줄어듦)
+  const MAX_VALID_N = 0.165; // 필요하면 0.15로 더 내리기
+  if (dIdx > MAX_VALID_N) return false;
+
+  // ✅ 핵심 3: 너무 닫힌 상태도(주먹/OK 닫힘 등) 차단
+  // raw close는 이미 위에서 끊지만, 여기서 한 번 더 안전하게
+  const MIN_VALID_N = 0.045;
+  if (dIdx < MIN_VALID_N) return false;
+
+  return true;
+}
+
+
+
 function pickBestHandIndex() {
   if (!handLandmarks || handLandmarks.length === 0) return -1;
 
@@ -456,6 +500,32 @@ function drawFinger() {
   if (hIdx < 0) return;
 
   const landmarks = handLandmarks[hIdx];
+  
+// ✅ 핀치/드로잉 자세 아니면 바로 차단 (다른 곳에서 점 찍히는거 방지)
+function isValidPinchPose(lm) {
+  const thumb = lm[4], idx = lm[8], mid = lm[12], ring = lm[16], pink = lm[20];
+
+  const dIdx  = distN(thumb, idx);
+  const dMid  = distN(thumb, mid);
+  const dRing = distN(thumb, ring);
+  const dPink = distN(thumb, pink);
+
+  const minOther = Math.min(dMid, dRing, dPink);
+
+  const MARGIN = 0.015;      // 좀 더 강하게
+  const MAX_VALID_N = 0.16;  // 필요하면 0.15로
+
+  // thumb가 index가 제일 가까워야 함
+  if (dIdx > minOther - MARGIN) return false;
+
+  // 너무 벌어지면 핀치/드로잉 아님
+  if (dIdx > MAX_VALID_N) return false;
+
+  return true;
+}
+  
+  
+  
 
   // index-only guard (normalized)
   if (INDEX_ONLY) {
@@ -546,6 +616,22 @@ function drawFinger() {
   const Ipx = mapLandmarkToCanvas(landmarks[8]);
   const Tpx = mapLandmarkToCanvas(landmarks[4]);
 
+  
+  // ✅ 랜드마크(손가락 끝) 순간 점프 프레임 차단
+if (lastTips) {
+  const di = dist(Ipx.x, Ipx.y, lastTips.ix, lastTips.iy);
+  const dt = dist(Tpx.x, Tpx.y, lastTips.tx, lastTips.ty);
+  if (di > TIP_JUMP_RESET || dt > TIP_JUMP_RESET) {
+    // 점프면 그 프레임은 버리고, 상태 리셋
+    lastTips = { ix: Ipx.x, iy: Ipx.y, tx: Tpx.x, ty: Tpx.y };
+    lastDotPos = null;
+    freezeAfterJump = FREEZE_AFTER_JUMP_FRAMES;
+    return;
+  }
+}
+lastTips = { ix: Ipx.x, iy: Ipx.y, tx: Tpx.x, ty: Tpx.y };
+  
+  
   // Stable blend factor
   const w = constrain(map(dN, DEAD_N, DRAW_ON_N, 0.18, 0.48), 0.18, 0.48);
   const rawCx = lerp(Ipx.x, Tpx.x, w);
