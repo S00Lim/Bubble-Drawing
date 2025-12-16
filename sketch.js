@@ -4,18 +4,25 @@
   - Anim modes: None / Bounce / Beat / Appear(loop)
   - No floating layer on pinch-close
 
-  ✅ NEW:
-    - Recolor/edit saved letter by changing Fill/Stroke/None after selecting from gallery
-    - Animation mode stored per-letter
-    - Color/style stored per-letter + auto thumb update
-    - Gallery thumbnails are LIVE animated (canvas preview)
-    - Per-letter export button
-    - Export formats: PNG / VIDEO(WebM)  (MP4 not native in-browser)
+  ✅ FIXED (hybrid smooth drawing + anti-jump):
+    1) 손 선택 안정화 + 다른 손 오인 감소
+       - 후보 손 필터링(너무 닫힌 핀치 제외) + 앵커 기반 선택 + 드로잉 중 lock
+    2) 드로잉 끊김 감소 (예전처럼 “항상 찍는 느낌”)
+       - 시간 gate 최소화(거리 gate 중심) + 제한적 gap-fill
+    3) 핀치 on/off 안정화
+       - 히스테리시스 + 연속 프레임 확인 + stop 후 쿨다운
+    4) 사이즈 변화 부드럽게
+       - r(브러시 크기) 스무딩
+    ✅ NEW:
+    5) “삐끗” 점프 프레임에서 제자리 왕복/폭발 방지
+       - jump reset + gap-fill 금지 + short freeze
+    6) 브러시 위치(cx,cy)도 스무딩 (핀치만 스무딩하던 문제 해결)
 ***********************/
 
 // ===== Media / p5 =====
 let video, hands, camera;
 let handLandmarks = [];
+let handHandedness = [];
 
 // ===== UI (DOM) =====
 let appEl, stageEl, gridEl;
@@ -28,7 +35,7 @@ let fillSwatchEl, strokeSwatchEl;
 let saveModeRadios = [];
 let animModeRadios = [];
 
-let exportFormatEl; // ✅ PNG / VIDEO(WebM)
+let exportFormatEl;
 
 // ===== letters + grid =====
 const LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("");
@@ -36,21 +43,21 @@ const GRID_SLOTS = 28;
 let selectedIndex = 0;
 
 // ===== layout sizes =====
-const STAGE_SIZE = 860;         // square stage
+const STAGE_SIZE = 860;
 const THUMB_SIZE = 120;
 
-// ===== cover crop params (square, no distortion, no bars) =====
+// ===== cover crop params =====
 let cover = { x: 0, y: 0, w: 0, h: 0, s: 1, vw: 0, vh: 0 };
 
 // ===== drawing data (dots) =====
 let currentDots = [];
 let savedDotsByLetter = Array(26).fill(null);
 
-// ✅ per-letter anim state
+// per-letter anim state
 let animModeByLetter = Array(26).fill("none");
 let appearStartFrameByLetter = Array(26).fill(0);
 
-// ✅ per-letter style state (컬러/none 상태도 알파벳별 저장)
+// per-letter style state
 let styleByLetter = Array(26).fill(null).map(() => ({
   fillNone: false,
   strokeNone: false,
@@ -58,7 +65,7 @@ let styleByLetter = Array(26).fill(null).map(() => ({
   stroke: "#000000"
 }));
 
-// ✅ live thumbnail canvas refs
+// live thumbnail canvas refs
 let thumbCanvasByLetter = Array(26).fill(null);
 let thumbCtxByLetter = Array(26).fill(null);
 let thumbHasData = Array(26).fill(false);
@@ -69,23 +76,74 @@ let wasDrawing = false;
 let wasClearHandOpen = false;
 
 // ================================
-// ✅ DRAWING TUNING (CHANGED)
+// ✅ PINCH + DRAWING TUNING (STABLE)
 // ================================
-const DRAW_ON_THRESHOLD  = 75;
-const DRAW_OFF_THRESHOLD = 55;
-const PINCH_DEADZONE = 35;
-const MIN_POINT_INTERVAL_MS = 22;
-const MIN_POINT_DIST = 9;
-const DIST_SMOOTHING = 0.23;
-const CLOSE_TRIGGER  = 25;
 
+// Normalized distances
+const DRAW_ON_N   = 0.095;
+const DRAW_OFF_N  = 0.070;
+const DEAD_N      = 0.065;
+const CLOSE_N     = 0.060;
+const RAW_CLOSE_N = 0.058; // 더 “즉시 스탑” 강하게
+
+// Anti jitter and sampling
+const DIST_SMOOTHING_N = 0.18;
+
+// ✅ 핵심: 끊김 줄이려고 “시간 gate” 거의 제거 (거리 gate 중심)
+const MIN_POINT_INTERVAL_MS = 0; // 0으로 두고 거리 기준으로만 찍음
+const MIN_POINT_DIST = 14;        // 촘촘하면 ↑, 듬성하면 ↓
+
+// Stop then accidental tiny dots prevention
+const STOP_COOLDOWN_FRAMES = 7;
+let stopCooldown = 0;
+
+// Debounce frames (drawing state stability)
+const START_CONFIRM_FRAMES = 2;
+const STOP_CONFIRM_FRAMES  = 2;
+let startCount = 0;
+let stopCount = 0;
+
+// Gap fill limit
+const MAX_GAP_STEPS = 18;
+
+// Appear anim config
 const APPEAR_SPEED = 1.6;
 const APPEAR_HOLD_FRAMES = 24;
 
-// ✅ internal helpers for anti-jitter
-let smoothedPinchDist = null;
+// internal helpers
+let smoothedPinchN = null;
 let lastDotTimeMs = 0;
 let lastDotPos = null;
+
+// ✅ 사이즈 스무딩
+let smoothedR = null;
+const R_SMOOTHING = 0.22;
+
+// ✅ index-only pinch guard
+const INDEX_ONLY = true;
+const OTHER_FINGER_BLOCK_N = 0.060;
+
+// ✅ hand selection + lock
+let lockedHandIdx = -1;
+let lockLostFrames = 0;
+const LOCK_LOST_FRAMES_MAX = 8;
+
+// ✅ 손 선택 안정화용 “앵커”(이전 프레임 index tip 위치)
+let lastAnchorN = null; // {x,y} normalized
+let anchorHoldFrames = 0;
+const ANCHOR_HOLD_MAX = 10;
+
+// ================================
+// ✅ NEW: Anti-jump / Outlier guard
+// ================================
+const JUMP_RESET_DIST = 120;       // px: 갑자기 점프하면 선 끊기
+const MAX_GAP_DIST    = 160;       // px: 이 이상이면 gap-fill 금지
+const FREEZE_AFTER_JUMP_FRAMES = 2;
+let freezeAfterJump = 0;
+
+// ✅ NEW: Brush position smoothing
+let smoothedPos = null;
+const POS_SMOOTHING = 0.35;        // 0.25~0.45 추천
 
 // ---------------------------
 // p5 entry
@@ -102,7 +160,6 @@ function setup() {
 
   drawingContext.imageSmoothingEnabled = true;
   drawingContext.imageSmoothingQuality = "high";
-
   pixelDensity(1);
 
   video = createCapture({
@@ -124,14 +181,17 @@ function setup() {
   hands = new Hands({
     locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
   });
+
   hands.setOptions({
     maxNumHands: 2,
     modelComplexity: 1,
     minDetectionConfidence: 0.7,
     minTrackingConfidence: 0.7,
   });
+
   hands.onResults((results) => {
     handLandmarks = results.multiHandLandmarks || [];
+    handHandedness = results.multiHandedness || [];
   });
 
   camera = new Camera(video.elt, {
@@ -167,7 +227,7 @@ function draw() {
 }
 
 // ---------------------------
-// ✅ Color picker open (Chrome showPicker first)
+// Color picker open
 // ---------------------------
 function openColorPicker(inputEl) {
   if (!inputEl) return;
@@ -180,7 +240,7 @@ function openColorPicker(inputEl) {
 }
 
 // ---------------------------
-// ✅ Force camera HD via track.applyConstraints
+// Force camera HD
 // ---------------------------
 async function forceCameraHD() {
   try {
@@ -258,7 +318,7 @@ function mapLandmarkToCanvas(lm) {
 }
 
 // ---------------------------
-// ✅ per-letter style helpers
+// per-letter style helpers
 // ---------------------------
 function getBrushStyle() {
   const fillNone = !!fillNoneEl.input.checked;
@@ -308,93 +368,316 @@ function applyStyleToCurrentLetterAndPersist() {
 }
 
 // ---------------------------
-// Drawing (dots)
+// ✅ Hand picking + lock (improved)
+// ---------------------------
+function pinchDistN(lm) {
+  return dist(lm[8].x, lm[8].y, lm[4].x, lm[4].y);
+}
+
+function indexTipN(lm) {
+  return { x: lm[8].x, y: lm[8].y };
+}
+
+function scoreHandForPick(lm) {
+  // 1) 너무 닫힌 핀치 제외
+  const dN = pinchDistN(lm);
+  if (dN < DEAD_N) return -Infinity;
+
+  // 2) 앵커에 가까울수록 점수 ↑
+  let anchorScore = 0;
+  if (lastAnchorN) {
+    const it = indexTipN(lm);
+    const dd = dist(it.x, it.y, lastAnchorN.x, lastAnchorN.y);
+    anchorScore = -dd;
+  }
+
+  // 3) DRAW_ON 근처 선호
+  const target = DRAW_ON_N;
+  const dScore = -Math.abs(dN - target);
+
+  return anchorScore * 2.2 + dScore * 0.8;
+}
+
+function pickBestHandIndex() {
+  if (!handLandmarks || handLandmarks.length === 0) return -1;
+
+  // 드로잉 중 lock 유지
+  if (wasDrawing && lockedHandIdx >= 0 && lockedHandIdx < handLandmarks.length) {
+    return lockedHandIdx;
+  }
+
+  let best = -1;
+  let bestScore = -Infinity;
+  for (let h = 0; h < handLandmarks.length; h++) {
+    const lm = handLandmarks[h];
+    const sc = scoreHandForPick(lm);
+    if (sc > bestScore) {
+      bestScore = sc;
+      best = h;
+    }
+  }
+  return best;
+}
+
+function updateHandLock(chosenIdx) {
+  if (chosenIdx < 0) {
+    lockLostFrames++;
+    if (lockLostFrames > LOCK_LOST_FRAMES_MAX) lockedHandIdx = -1;
+    return;
+  }
+
+  lockLostFrames = 0;
+
+  // 드로잉 중에만 lock
+  if (wasDrawing) lockedHandIdx = chosenIdx;
+  else lockedHandIdx = -1;
+
+  // 앵커 갱신
+  const lm = handLandmarks[chosenIdx];
+  const it = indexTipN(lm);
+  lastAnchorN = { x: it.x, y: it.y };
+  anchorHoldFrames = ANCHOR_HOLD_MAX;
+}
+
+// ---------------------------
+// Drawing (dots) - hybrid smooth + anti-jump
 // ---------------------------
 function drawFinger() {
   if (!handLandmarks || handLandmarks.length === 0) {
-    wasDrawing = false;
-    smoothedPinchDist = null;
-    lastDotPos = null;
+    hardResetFingerState();
     return;
   }
 
-  const landmarks = handLandmarks[0];
-  const I = mapLandmarkToCanvas(landmarks[8]);
-  const T = mapLandmarkToCanvas(landmarks[4]);
+  if (anchorHoldFrames > 0) anchorHoldFrames--;
+  else lastAnchorN = null;
 
-  const rawD = dist(I.x, I.y, T.x, T.y);
+  const hIdx = pickBestHandIndex();
+  updateHandLock(hIdx);
+  if (hIdx < 0) return;
 
-  if (smoothedPinchDist == null) smoothedPinchDist = rawD;
-  smoothedPinchDist = lerp(smoothedPinchDist, rawD, DIST_SMOOTHING);
+  const landmarks = handLandmarks[hIdx];
 
-  const d = smoothedPinchDist;
+  // index-only guard (normalized)
+  if (INDEX_ONLY) {
+    const thumb = landmarks[4];
+    const idx   = landmarks[8];
+    const mid   = landmarks[12];
+    const ring  = landmarks[16];
+    const pink  = landmarks[20];
 
-  if (d < PINCH_DEADZONE) {
-    wasDrawing = false;
-    return;
-  }
+    const dIdx  = dist(thumb.x, thumb.y, idx.x, idx.y);
+    const dMid  = dist(thumb.x, thumb.y, mid.x, mid.y);
+    const dRing = dist(thumb.x, thumb.y, ring.x, ring.y);
+    const dPink = dist(thumb.x, thumb.y, pink.x, pink.y);
 
-  let isDrawing;
-  if (!wasDrawing) {
-    isDrawing = d > DRAW_ON_THRESHOLD;
-  } else {
-    isDrawing = d > DRAW_OFF_THRESHOLD;
-  }
+    const minOther = Math.min(dMid, dRing, dPink);
 
-  if (wasDrawing && d < CLOSE_TRIGGER) {
-    isDrawing = false;
-    wasDrawing = false;
-
-    if (getAnimMode() === "appear") {
-      appearStartFrameByLetter[selectedIndex] = frameCount;
+    if (minOther < dIdx && minOther < OTHER_FINGER_BLOCK_N) {
+      wasDrawing = false;
+      lastDotPos = null;
+      startCount = 0;
+      stopCount = 0;
+      smoothedPos = null;
+      return;
     }
+  }
+
+  // normalized pinch distance
+  const rawN = pinchDistN(landmarks);
+  if (smoothedPinchN == null) smoothedPinchN = rawN;
+  smoothedPinchN = lerp(smoothedPinchN, rawN, DIST_SMOOTHING_N);
+  const dN = smoothedPinchN;
+
+  // 즉시 stop (raw 기준)
+  if (rawN < RAW_CLOSE_N) {
+    if (wasDrawing) stopDrawingNow();
     return;
   }
 
-  if (isDrawing) {
-    const cx = (I.x + T.x) / 2;
-    const cy = (I.y + T.y) / 2;
+  if (stopCooldown > 0) stopCooldown--;
 
+  // Hard stop if too close
+  if (dN < CLOSE_N) {
+    if (wasDrawing) stopDrawingNow();
+    return;
+  }
+
+  // Dead zone
+  if (dN < DEAD_N) {
+    wasDrawing = false;
+    lastDotPos = null;
+    startCount = 0;
+    stopCount = 0;
+    smoothedPos = null;
+    return;
+  }
+
+  // Debounced hysteresis
+  let wantDraw = wasDrawing;
+
+  if (!wasDrawing) {
+    if (dN > DRAW_ON_N && stopCooldown === 0) {
+      startCount++;
+      if (startCount >= START_CONFIRM_FRAMES) {
+        wantDraw = true;
+        startCount = 0;
+      }
+    } else {
+      startCount = 0;
+    }
+  } else {
+    if (dN < DRAW_OFF_N) {
+      stopCount++;
+      if (stopCount >= STOP_CONFIRM_FRAMES) {
+        wantDraw = false;
+        stopCount = 0;
+        stopCooldown = STOP_COOLDOWN_FRAMES;
+
+        if (getAnimMode() === "appear") {
+          appearStartFrameByLetter[selectedIndex] = frameCount;
+        }
+      }
+    } else {
+      stopCount = 0;
+    }
+  }
+
+  // Pixel positions
+  const Ipx = mapLandmarkToCanvas(landmarks[8]);
+  const Tpx = mapLandmarkToCanvas(landmarks[4]);
+
+  // Stable blend factor
+  const w = constrain(map(dN, DEAD_N, DRAW_ON_N, 0.18, 0.48), 0.18, 0.48);
+  const rawCx = lerp(Ipx.x, Tpx.x, w);
+  const rawCy = lerp(Ipx.y, Tpx.y, w);
+
+  // ✅ NEW: Position smoothing
+  if (!smoothedPos) smoothedPos = { x: rawCx, y: rawCy };
+  smoothedPos.x = lerp(smoothedPos.x, rawCx, POS_SMOOTHING);
+  smoothedPos.y = lerp(smoothedPos.y, rawCy, POS_SMOOTHING);
+
+  const cx = smoothedPos.x;
+  const cy = smoothedPos.y;
+
+  // Brush radius from pixel distance + smoothing
+  const dPx = dist(Ipx.x, Ipx.y, Tpx.x, Tpx.y);
+  const minDist = 90;
+  const maxDist = 200;
+  const minR = 15;
+  const maxR = 50;
+
+  const rawR = map(constrain(dPx, minDist, maxDist), minDist, maxDist, minR, maxR);
+  if (smoothedR == null) smoothedR = rawR;
+  smoothedR = lerp(smoothedR, rawR, R_SMOOTHING);
+  const r = smoothedR;
+
+  const style = getBrushStyle();
+  if (style.fillNone && style.strokeNone) {
+    wasDrawing = wantDraw;
+    return;
+  }
+
+  if (wantDraw) {
     const nowMs = performance.now();
 
-    let movedEnough = true;
-    if (lastDotPos) {
-      const md = dist(cx, cy, lastDotPos.x, lastDotPos.y);
-      movedEnough = md >= MIN_POINT_DIST;
+    // freeze after jump (prevents ping-pong explosion)
+    if (freezeAfterJump > 0) {
+      freezeAfterJump--;
+      lastDotPos = { x: cx, y: cy };
+      lastDotTimeMs = nowMs;
+      wasDrawing = wantDraw;
+      return;
     }
 
+    let md = Infinity;
+    if (lastDotPos) md = dist(cx, cy, lastDotPos.x, lastDotPos.y);
+
+    // ✅ NEW: Jump reset (line break)
+    if (lastDotPos && md > JUMP_RESET_DIST) {
+      lastDotPos = { x: cx, y: cy };
+      lastDotTimeMs = nowMs;
+      freezeAfterJump = FREEZE_AFTER_JUMP_FRAMES;
+      wasDrawing = wantDraw;
+      return;
+    }
+
+    // ✅ NEW: Too far -> do NOT gap-fill
+    if (lastDotPos && md > MAX_GAP_DIST) {
+      lastDotPos = { x: cx, y: cy };
+      lastDotTimeMs = nowMs;
+      wasDrawing = wantDraw;
+      return;
+    }
+
+    // time gate (0이면 사실상 항상 통과)
     const timeEnough = (nowMs - lastDotTimeMs) >= MIN_POINT_INTERVAL_MS;
 
-    if (movedEnough && timeEnough) {
-      const minDist = 90;
-      const maxDist = 200;
-      const minR = 15;
-      const maxR = 50;
-      const r = map(constrain(d, minDist, maxDist), minDist, maxDist, minR, maxR);
-
-      const style = getBrushStyle();
-
-      if (!(style.fillNone && style.strokeNone)) {
-        currentDots.push({
-          x: cx,
-          y: cy,
-          r,
-          fill: style.fillNone ? null : style.fill,
-          stroke: style.strokeNone ? null : style.stroke,
-          sw: style.strokeNone ? 0 : 3,
-          order: currentDots.length,
-          phase: random(TWO_PI)
-        });
-
-        lastDotTimeMs = nowMs;
+    if (!lastDotPos) {
+      pushDot(cx, cy, r, style);
+      lastDotPos = { x: cx, y: cy };
+      lastDotTimeMs = nowMs;
+    } else {
+      if (md >= MIN_POINT_DIST && timeEnough) {
+        const steps = Math.min(MAX_GAP_STEPS, Math.max(1, Math.floor(md / MIN_POINT_DIST)));
+        for (let s = 1; s <= steps; s++) {
+          const tt = s / steps;
+          const x = lerp(lastDotPos.x, cx, tt);
+          const y = lerp(lastDotPos.y, cy, tt);
+          pushDot(x, y, r, style);
+        }
         lastDotPos = { x: cx, y: cy };
+        lastDotTimeMs = nowMs;
       }
     }
   } else {
     lastDotPos = null;
   }
 
-  wasDrawing = isDrawing;
+  wasDrawing = wantDraw;
+}
+
+function stopDrawingNow() {
+  wasDrawing = false;
+  lastDotPos = null;
+  startCount = 0;
+  stopCount = 0;
+  stopCooldown = STOP_COOLDOWN_FRAMES;
+  freezeAfterJump = 0;
+  smoothedPos = null;
+
+  if (getAnimMode() === "appear") {
+    appearStartFrameByLetter[selectedIndex] = frameCount;
+  }
+}
+
+function hardResetFingerState() {
+  wasDrawing = false;
+  smoothedPinchN = null;
+  lastDotPos = null;
+  lastDotTimeMs = 0;
+  startCount = 0;
+  stopCount = 0;
+  stopCooldown = 0;
+  lockedHandIdx = -1;
+  smoothedR = null;
+  lastAnchorN = null;
+  anchorHoldFrames = 0;
+
+  freezeAfterJump = 0;
+  smoothedPos = null;
+}
+
+function pushDot(x, y, r, style) {
+  currentDots.push({
+    x,
+    y,
+    r,
+    fill: style.fillNone ? null : style.fill,
+    stroke: style.strokeNone ? null : style.stroke,
+    sw: style.strokeNone ? 0 : 3,
+    order: currentDots.length,
+    phase: random(TWO_PI)
+  });
 }
 
 function checkClearGesture() {
@@ -404,21 +687,29 @@ function checkClearGesture() {
   }
 
   const clearHand = handLandmarks[1];
-  const I = mapLandmarkToCanvas(clearHand[8]);
-  const T = mapLandmarkToCanvas(clearHand[4]);
-  const d = dist(I.x, I.y, T.x, T.y);
+  const dN = dist(clearHand[8].x, clearHand[8].y, clearHand[4].x, clearHand[4].y);
 
-  const OPEN_DIST = 80;
-  const CLOSE_DIST = 20;
+  const OPEN_N  = 0.10;
+  const CLOSE_N2 = 0.05;
 
-  if (d > OPEN_DIST) wasClearHandOpen = true;
+  if (dN > OPEN_N) wasClearHandOpen = true;
 
-  if (wasClearHandOpen && d < CLOSE_DIST) {
+  if (wasClearHandOpen && dN < CLOSE_N2) {
     currentDots = [];
     wasClearHandOpen = false;
     appearStartFrameByLetter[selectedIndex] = frameCount;
+
     lastDotPos = null;
     lastDotTimeMs = 0;
+    smoothedPinchN = null;
+    smoothedR = null;
+    smoothedPos = null;
+    freezeAfterJump = 0;
+
+    wasDrawing = false;
+    startCount = 0;
+    stopCount = 0;
+    stopCooldown = STOP_COOLDOWN_FRAMES;
   }
 }
 
@@ -479,6 +770,15 @@ function redrawCurrent() {
 
   lastDotPos = null;
   lastDotTimeMs = 0;
+  smoothedPinchN = null;
+  smoothedR = null;
+  smoothedPos = null;
+  freezeAfterJump = 0;
+
+  wasDrawing = false;
+  startCount = 0;
+  stopCount = 0;
+  stopCooldown = STOP_COOLDOWN_FRAMES;
 }
 
 function saveCurrent() {
@@ -507,6 +807,15 @@ function selectLetter(i) {
 
   lastDotPos = null;
   lastDotTimeMs = 0;
+  smoothedPinchN = null;
+  smoothedR = null;
+  smoothedPos = null;
+  freezeAfterJump = 0;
+
+  wasDrawing = false;
+  startCount = 0;
+  stopCount = 0;
+  stopCooldown = STOP_COOLDOWN_FRAMES;
 
   const saved = savedDotsByLetter[i];
   if (saved && saved.length) {
@@ -585,9 +894,7 @@ function renderThumbOnce(i) {
   ctx.fillRect(0,0,THUMB_SIZE,THUMB_SIZE);
 }
 
-// ---------------------------
-// ✅ per-letter anim getter + UI setter
-// ---------------------------
+// per-letter anim getter + UI setter
 function getAnimMode() {
   return animModeByLetter[selectedIndex] || "none";
 }
@@ -625,7 +932,7 @@ function syncSwatches() {
 }
 
 // ---------------------------
-// ✅ LIVE thumbnail animation loop
+// LIVE thumbnail animation loop
 // ---------------------------
 function startThumbLoop() {
   const FPS = 24;
@@ -727,7 +1034,7 @@ function drawDotsToThumbCtx(ctx, dots, mode, tSec) {
 }
 
 // ---------------------------
-// ✅ Export (PNG / VIDEO WebM)
+// Export (PNG / VIDEO WebM)
 // ---------------------------
 function getExportFormat() {
   return exportFormatEl ? exportFormatEl.value : "png";
@@ -735,14 +1042,10 @@ function getExportFormat() {
 
 function exportLetter(i) {
   const fmt = getExportFormat();
-  if (fmt === "png") {
-    exportPNG(i);
-  } else {
-    exportVideoWebM(i);
-  }
+  if (fmt === "png") exportPNG(i);
+  else exportVideoWebM(i);
 }
 
-// ✅ CHANGED: export all
 function exportAllLetters() {
   for (let i = 0; i < 26; i++) {
     const dots = savedDotsByLetter[i];
@@ -751,7 +1054,7 @@ function exportAllLetters() {
   }
 }
 
-// ✅ CHANGED: PNG = transparent when saveMode === "type"
+// PNG = transparent when saveMode === "type"
 function exportPNG(i) {
   const dots = savedDotsByLetter[i];
   if (!dots || !dots.length) return;
@@ -762,13 +1065,9 @@ function exportPNG(i) {
   out.width = STAGE_SIZE;
   out.height = STAGE_SIZE;
 
-  // ✅ alpha true for transparency
   const ctx = out.getContext("2d", { alpha: true });
-
-  // ✅ clear canvas (transparent)
   ctx.clearRect(0, 0, STAGE_SIZE, STAGE_SIZE);
 
-  // camera background stays as-is (drawn image becomes background)
   if (modeSave === "camera") {
     const vw = cover.vw || video.elt.videoWidth;
     const vh = cover.vh || video.elt.videoHeight;
@@ -786,7 +1085,6 @@ function exportPNG(i) {
       ctx.restore();
     }
   }
-  // ✅ type-only: no gray fill at all => transparent PNG
 
   const mode = animModeByLetter[i] || "none";
   const tSec = (performance.now() - (thumbAnimStartMsByLetter[i] || performance.now())) / 1000;
@@ -844,7 +1142,6 @@ function drawDotsToExportCtx(ctx, dots, mode, tSec) {
   ctx.restore();
 }
 
-// ✅ NOTE: video export는 그대로(배경 회색 유지) 원하면 다음에 투명 WebM도 가능
 async function exportVideoWebM(i) {
   const dots = savedDotsByLetter[i];
   if (!dots || !dots.length) return;
@@ -856,13 +1153,11 @@ async function exportVideoWebM(i) {
   out.width = STAGE_SIZE;
   out.height = STAGE_SIZE;
 
-  // ✅ alpha:true so canvas can carry transparency
   const ctx = out.getContext("2d", { alpha: true });
 
   const FPS = 30;
   const stream = out.captureStream(FPS);
 
-  // ✅ Prefer VP9 (best chance for alpha)
   let mime = "";
   if (MediaRecorder.isTypeSupported("video/webm;codecs=vp9")) mime = "video/webm;codecs=vp9";
   else if (MediaRecorder.isTypeSupported("video/webm;codecs=vp8")) mime = "video/webm;codecs=vp8";
@@ -887,10 +1182,8 @@ async function exportVideoWebM(i) {
   for (let f = 0; f < totalFrames; f++) {
     const tSec = (performance.now() - startMs) / 1000;
 
-    // ✅ Always clear to transparent each frame
     ctx.clearRect(0, 0, STAGE_SIZE, STAGE_SIZE);
 
-    // ✅ If camera mode, draw camera (no transparency because pixels exist)
     if (modeSave === "camera") {
       const vw = cover.vw || video.elt.videoWidth;
       const vh = cover.vh || video.elt.videoHeight;
@@ -908,7 +1201,6 @@ async function exportVideoWebM(i) {
         ctx.restore();
       }
     }
-    // ✅ type-only: leave background transparent
 
     drawDotsToExportCtx(ctx, dots, mode, tSec);
     await waitMs(1000 / FPS);
@@ -920,7 +1212,6 @@ async function exportVideoWebM(i) {
     rec.onstop = () => resolve(new Blob(chunks, { type: mime }));
   });
 
-  // ✅ optional: quick warning if browser likely stripped alpha
   console.log("Recorded:", mime, "size:", blob.size);
 
   const url = URL.createObjectURL(blob);
@@ -928,6 +1219,7 @@ async function exportVideoWebM(i) {
   downloadURL(url, `${LETTERS[i]}_bubble${suffix}.webm`);
   setTimeout(() => URL.revokeObjectURL(url), 2000);
 }
+
 function waitMs(ms) {
   return new Promise((res) => setTimeout(res, ms));
 }
@@ -1060,7 +1352,7 @@ function buildDOM() {
 
   panel.appendChild(hr("rule"));
 
-  // ✅ Export format selector (panel)
+  // Export format selector
   const exportGroup = div("group");
   const expRow = div("exportRow");
   const expLabel = document.createElement("span");
@@ -1081,12 +1373,10 @@ function buildDOM() {
   expRow.appendChild(exportFormatEl);
   exportGroup.appendChild(expRow);
 
-  // current letter export button
   const expBtn = button("EXPORT CURRENT LETTER", "exportBtn");
   expBtn.addEventListener("click", () => exportLetter(selectedIndex));
   exportGroup.appendChild(expBtn);
 
-  // ✅ CHANGED: export all letters button
   const expAllBtn = button("EXPORT EVERY LETTER", "exportBtn");
   expAllBtn.addEventListener("click", exportAllLetters);
   exportGroup.appendChild(expAllBtn);
@@ -1149,7 +1439,6 @@ function injectStyles() {
       outline:none;
     }
 
-    /* LEFT */
     .side{
       width:320px;
       padding:22px 18px;
@@ -1266,7 +1555,6 @@ function injectStyles() {
     }
     .exportBtn:hover{ background:#f2f2f2; }
 
-    /* CENTER */
     .center{ width:${STAGE_SIZE}px; }
     .stageWrap{
       position:relative;
@@ -1311,7 +1599,6 @@ function injectStyles() {
       display:none;
     }
 
-    /* RIGHT GRID */
     .right{
       width:420px;
       padding:10px 0 0 0;
@@ -1353,7 +1640,6 @@ function injectStyles() {
       background:#d9d9d9;
     }
 
-    /* ✅ CHANGED: center align export button horizontally inside the cell */
     .cellExportBtn{
       position:absolute;
       left:50%;
