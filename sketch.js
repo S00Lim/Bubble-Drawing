@@ -1,25 +1,4 @@
 
-/***********************
-  Bubble Type Drawing (Square Stage)
-  - JS builds: layout + styles + DOM
-  - Anim modes: None / Bounce / Beat / Appear(loop)
-  - No floating layer on pinch-close
-
-  ✅ FIXED (hybrid smooth drawing + anti-jump):
-    1) 손 선택 안정화 + 다른 손 오인 감소
-       - 후보 손 필터링(너무 닫힌 핀치 제외) + 앵커 기반 선택 + 드로잉 중 lock
-    2) 드로잉 끊김 감소 (예전처럼 “항상 찍는 느낌”)
-       - 시간 gate 최소화(거리 gate 중심) + 제한적 gap-fill
-    3) 핀치 on/off 안정화
-       - 히스테리시스 + 연속 프레임 확인 + stop 후 쿨다운
-    4) 사이즈 변화 부드럽게
-       - r(브러시 크기) 스무딩
-    ✅ NEW:
-    5) “삐끗” 점프 프레임에서 제자리 왕복/폭발 방지
-       - jump reset + gap-fill 금지 + short freeze
-    6) 브러시 위치(cx,cy)도 스무딩 (핀치만 스무딩하던 문제 해결)
-***********************/
-
 // ===== Media / p5 =====
 let video, hands, camera;
 let handLandmarks = [];
@@ -139,8 +118,7 @@ let lastAnchorN = null; // {x,y} normalized
 let anchorHoldFrames = 0;
 const ANCHOR_HOLD_MAX = 10;
 
-// ================================
-// ✅ NEW: Anti-jump / Outlier guard
+
 // ================================
 const JUMP_RESET_DIST = 120;       // px: 갑자기 점프하면 선 끊기
 const MAX_GAP_DIST    = 160;       // px: 이 이상이면 gap-fill 금지
@@ -1492,6 +1470,36 @@ function buildDOM() {
   const right = div("right");
   gridEl = div("grid");
   right.appendChild(gridEl);
+
+  // ✅ NEW: SHARE / GALLERY buttons under the grid (no CSS edits)
+  const galleryBtns = div("");
+  galleryBtns.style.display = "flex";
+  galleryBtns.style.gap = "10px";
+  galleryBtns.style.justifyContent = "center";
+  galleryBtns.style.marginTop = "30px";
+
+  const shareBtn = button("SHARE", "exportBtn");
+  shareBtn.addEventListener("click", () => {
+    // TODO: later
+  });
+
+  const galleryBtn = button("GALLERY", "exportBtn");
+  galleryBtn.addEventListener("click", () => {
+    // TODO: later
+  });
+  
+  [shareBtn, galleryBtn].forEach(btn => {
+  btn.style.padding = "12px 22px";
+  btn.style.fontSize = "14px";
+  btn.style.border = "1px solid #111";
+  btn.style.background = "#fff";
+  btn.style.borderRadius = "999px";
+  btn.style.cursor = "pointer";
+});
+
+  galleryBtns.appendChild(shareBtn);
+  galleryBtns.appendChild(galleryBtn);
+  right.appendChild(galleryBtns);
 
   page.appendChild(panel);
   page.appendChild(center);
